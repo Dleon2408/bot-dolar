@@ -165,3 +165,24 @@ def enviar_texto(destino, texto):
 @app.get("/")
 async def inicio():
     return {"estado": "Bot del dolar funcionando"}
+
+
+# Pagina de Politica de Privacidad (Meta la pide para publicar la app)
+@app.get("/privacy")
+async def privacidad():
+    html = """
+    <html><head><meta charset="utf-8"><title>Politica de Privacidad</title></head>
+    <body style="font-family:Arial;max-width:700px;margin:40px auto;padding:0 20px;">
+    <h1>Politica de Privacidad</h1>
+    <p>Este bot de uso personal recibe imagenes y texto enviados por el
+    usuario a traves de WhatsApp con el unico fin de editar la imagen
+    solicitada y devolverla.</p>
+    <ul>
+      <li>No almacenamos las imagenes ni los mensajes de forma permanente.</li>
+      <li>No compartimos ningun dato con terceros.</li>
+      <li>Las imagenes se procesan temporalmente y se descartan.</li>
+    </ul>
+    <p>Para cualquier consulta, contacta al administrador del bot.</p>
+    </body></html>
+    """
+    return Response(content=html, media_type="text/html")
