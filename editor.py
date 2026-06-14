@@ -23,31 +23,44 @@ def _normalizar(texto):
 def _buscar_texto(img, valor_viejo):
     """
     Usa OCR para ubicar 'valor_viejo' en la imagen.
+    Mejoras:
+      - Amplia la imagen 2x para que el OCR lea mejor los numeros chicos.
+      - Da PRIORIDAD a la coincidencia EXACTA (asi '3.375' no se confunde
+        con otro numero); solo si no hay exacta, usa coincidencia parcial.
     Devuelve (left, top, width, height) o None si no lo encuentra.
     """
     objetivo = _normalizar(valor_viejo)
-    datos = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
-    mejor = None
-    mejor_conf = -1
+    escala = 2
+    grande = img.resize((img.width * escala, img.height * escala), Image.LANCZOS)
+    datos = pytesseract.image_to_data(grande, output_type=pytesseract.Output.DICT)
+
+    exactos, parciales = [], []
     for i in range(len(datos["text"])):
         palabra = _normalizar(datos["text"][i])
         if not palabra:
             continue
-        if palabra == objetivo or objetivo in palabra:
-            try:
-                conf = float(datos["conf"][i])
-            except ValueError:
-                conf = 0
-            if conf > mejor_conf:
-                mejor_conf = conf
-                mejor = (
-                    datos["left"][i],
-                    datos["top"][i],
-                    datos["width"][i],
-                    datos["height"][i],
-                )
-    return mejor
+        try:
+            conf = float(datos["conf"][i])
+        except ValueError:
+            conf = 0
+        # Volvemos las coordenadas al tamano original (dividiendo por la escala)
+        caja = (
+            datos["left"][i] // escala,
+            datos["top"][i] // escala,
+            datos["width"][i] // escala,
+            datos["height"][i] // escala,
+        )
+        if palabra == objetivo:
+            exactos.append((conf, caja))
+        elif objetivo in palabra:
+            parciales.append((conf, caja))
+
+    candidatos = exactos if exactos else parciales
+    if not candidatos:
+        return None
+    candidatos.sort(key=lambda c: c[0], reverse=True)  # mayor confianza primero
+    return candidatos[0][1]
 
 
 def _region_ampliada(img, caja):

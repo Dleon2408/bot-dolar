@@ -23,6 +23,14 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "fodie123")  # Lo inventas tu
 GRAPH = "https://graph.facebook.com/v21.0"
 TIMEOUT = 30  # segundos maximos de espera en cada llamada a Meta
 
+# Lista blanca: SOLO estos numeros pueden usar el bot.
+# Se configura en Render (variable PERMITIDOS), separados por coma,
+# en formato internacional sin "+", ej: 51987654321,51998877665
+# Si se deja vacio, responde a cualquiera que Meta permita.
+PERMITIDOS = [
+    n.strip() for n in os.environ.get("PERMITIDOS", "").split(",") if n.strip()
+]
+
 app = FastAPI()
 
 
@@ -59,6 +67,11 @@ async def recibir(request: Request, background: BackgroundTasks):
             PROCESADOS.clear()
 
         de = mensaje["from"]  # numero del que escribe
+
+        # Candado: si hay lista blanca y el numero no esta, lo ignoramos
+        if PERMITIDOS and de not in PERMITIDOS:
+            print("Numero no autorizado, ignorado:", de)
+            return {"ok": True}
 
         # Procesamos en SEGUNDO PLANO para responderle a Meta al instante
         # (asi no reenvia el mensaje y no llegan imagenes repetidas).
