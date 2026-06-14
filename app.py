@@ -167,6 +167,23 @@ async def inicio():
     return {"estado": "Bot del dolar funcionando"}
 
 
+# ID de tu cuenta de WhatsApp Business (lo vimos en la configuracion)
+WABA_ID = os.environ.get("WABA_ID", "1039029152028883")
+
+
+# Pagina "secreta" para enganchar la app a tu cuenta de WhatsApp.
+# Abrela UNA vez en el navegador despues de desplegar.
+@app.get("/activar")
+async def activar():
+    try:
+        r = requests.post(
+            f"{GRAPH}/{WABA_ID}/subscribed_apps", headers=_headers()
+        )
+        return {"resultado": r.json()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Pagina de Politica de Privacidad (Meta la pide para publicar la app)
 @app.get("/privacy")
 async def privacidad():
