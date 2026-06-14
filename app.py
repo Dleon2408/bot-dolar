@@ -1,6 +1,7 @@
 # ============================================================
 #  SERVIDOR WHATSAPP (API oficial de Meta - Cloud API)
 #  Recibe imagen + texto, edita el numero y responde la imagen.
+#  Incluye flujo guiado tipo formulario y botones.
 # ============================================================
 
 import os
@@ -10,26 +11,42 @@ import tempfile
 import requests
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 
-from editor import reemplazar_texto
+from editor import reemplazar_texto, listar_numeros
 
 # Memoria de mensajes ya procesados, para no responder dos veces
 # si Meta reenvia el mismo mensaje (reintentos).
 PROCESADOS = set()
 
-# ---- Configuracion (se lee de variables de entorno en Render) ----
-META_TOKEN = os.environ.get("META_TOKEN", "")          # Token de acceso de Meta
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")  # ID del numero de WhatsApp
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "fodie123")  # Lo inventas tu
-GRAPH = "https://graph.facebook.com/v21.0"
-TIMEOUT = 30  # segundos maximos de espera en cada llamada a Meta
+# Memoria del "formulario" de cada usuario (en que paso va).
+# de -> {"paso": "viejo"/"nuevo", "media_id": ..., "viejo": ...}
+ESTADOS = {}
 
-# Lista blanca: SOLO estos numeros pueden usar el bot.
-# Se configura en Render (variable PERMITIDOS), separados por coma,
-# en formato internacional sin "+", ej: 51987654321,51998877665
-# Si se deja vacio, responde a cualquiera que Meta permita.
+# Palabras para reconocer saludos y despedidas
+SALUDOS = {"hola", "holi", "buenas", "buenos", "hi", "hello", "ola", "hey", "alo"}
+DESPEDIDAS = {"gracias", "adios", "chau", "chao", "listo", "ok", "oka", "bye"}
+
+TEXTO_AYUDA = (
+    "📖 *Cómo usarme:*\n"
+    "1) Mándame una captura (imagen).\n"
+    "2) Te pregunto qué número cambiar y por cuál.\n"
+    "3) Te devuelvo la imagen editada.\n\n"
+    "También puedes mandar la imagen con el texto:\n"
+    "  cambia 3.410 por 3.400"
+)
+
+# ---- Configuracion (se lee de variables de entorno en Render) ----
+META_TOKEN = os.environ.get("META_TOKEN", "")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "fodie123")
+GRAPH = "https://graph.facebook.com/v21.0"
+TIMEOUT = 30
+
+# Lista blanca: SOLO estos numeros pueden usar el bot (vacio = todos).
 PERMITIDOS = [
     n.strip() for n in os.environ.get("PERMITIDOS", "").split(",") if n.strip()
 ]
+
+WABA_ID = os.environ.get("WABA_ID", "1039029152028883")
 
 app = FastAPI()
 
@@ -55,37 +72,51 @@ async def recibir(request: Request, background: BackgroundTasks):
     try:
         valor = data["entry"][0]["changes"][0]["value"]
         if "messages" not in valor:
-            return {"ok": True}  # puede ser un "status", lo ignoramos
+            return {"ok": True}
         mensaje = valor["messages"][0]
 
-        # Evitar duplicados: si ya vimos este mensaje, lo ignoramos
+        # Evitar duplicados
         msg_id = mensaje.get("id")
         if msg_id in PROCESADOS:
             return {"ok": True}
         PROCESADOS.add(msg_id)
-        if len(PROCESADOS) > 1000:      # no dejar que crezca infinito
+        if len(PROCESADOS) > 1000:
             PROCESADOS.clear()
 
-        de = mensaje["from"]  # numero del que escribe
+        de = mensaje["from"]
 
-        # Candado: si hay lista blanca y el numero no esta, lo ignoramos
+        # Candado opcional (lista blanca)
         if PERMITIDOS and de not in PERMITIDOS:
             print("Numero no autorizado, ignorado:", de)
             return {"ok": True}
 
-        # Procesamos en SEGUNDO PLANO para responderle a Meta al instante
-        # (asi no reenvia el mensaje y no llegan imagenes repetidas).
-        if mensaje.get("type") == "image":
-            caption = mensaje["image"].get("caption", "")
+        tipo = mensaje.get("type")
+
+        if tipo == "image":
             media_id = mensaje["image"]["id"]
-            background.add_task(procesar_imagen, de, media_id, caption)
-        elif mensaje.get("type") == "text":
-            background.add_task(
-                enviar_texto,
-                de,
-                "Mandame una *imagen* con un texto (caption) tipo:\n"
-                "  cambia 3.410 por 3.400",
-            )
+            caption = mensaje["image"].get("caption", "")
+            viejo, nuevo = parse_instruccion(caption)
+            if viejo and nuevo:
+                # Camino rapido: vino todo en el texto de la imagen
+                ESTADOS.pop(de, None)
+                background.add_task(procesar_edicion, de, media_id, viejo, nuevo)
+            else:
+                # Inicia el formulario guiado
+                ESTADOS[de] = {"paso": "viejo", "media_id": media_id}
+                background.add_task(
+                    enviar_texto, de,
+                    "📷 ¡Recibí tu imagen!\n\n"
+                    "¿Qué número quieres cambiar?\n"
+                    "Escríbelo tal como aparece (ej: 3.410)",
+                )
+
+        elif tipo == "interactive":
+            br = mensaje["interactive"].get("button_reply", {})
+            manejar_texto(de, br.get("id", ""), background)
+
+        elif tipo == "text":
+            manejar_texto(de, mensaje["text"]["body"], background)
+
     except Exception as e:
         print("Error procesando:", e)
 
@@ -93,59 +124,121 @@ async def recibir(request: Request, background: BackgroundTasks):
 
 
 # ------------------------------------------------------------
-#  Logica principal: descargar, editar y responder
+#  Logica del formulario / conversacion
 # ------------------------------------------------------------
-def procesar_imagen(destino, media_id, caption):
-    viejo, nuevo = parse_instruccion(caption)
-    if not viejo or not nuevo:
-        enviar_texto(
-            destino,
-            "🤔 No entendi el cambio.\n\n"
-            "Manda la imagen y en el texto escribe que cambiar, por ejemplo:\n"
-            "  cambia 3.410 por 3.400",
+def manejar_texto(de, texto, background):
+    t = texto.strip().lower()
+    palabras = set(re.findall(r"\w+", t))
+    estado = ESTADOS.get(de)
+
+    # --- Botones ---
+    if texto == "editar_otra":
+        ESTADOS.pop(de, None)
+        background.add_task(
+            enviar_texto, de, "📷 ¡Genial! Mándame la siguiente imagen."
         )
         return
+    if texto == "terminar":
+        ESTADOS.pop(de, None)
+        background.add_task(
+            enviar_texto, de, "🙌 ¡Listo! Aquí estaré cuando necesites. 👋"
+        )
+        return
+    if texto == "ayuda" or "ayuda" in palabras or "menu" in palabras:
+        background.add_task(enviar_texto, de, TEXTO_AYUDA)
+        return
 
+    # --- En medio del formulario ---
+    if estado:
+        num = primer_numero(texto)
+        if not num:
+            background.add_task(
+                enviar_texto, de, "Escríbeme solo el número, por ejemplo: 3.410"
+            )
+            return
+        if estado["paso"] == "viejo":
+            estado["viejo"] = num
+            estado["paso"] = "nuevo"
+            background.add_task(
+                enviar_texto, de, f"✏️ Cambiar *{num}* por... ¿cuál número?"
+            )
+            return
+        if estado["paso"] == "nuevo":
+            media_id = estado["media_id"]
+            viejo = estado["viejo"]
+            ESTADOS.pop(de, None)
+            background.add_task(procesar_edicion, de, media_id, viejo, num)
+            return
+
+    # --- Sin formulario activo: saludo / despedida / otro ---
+    if palabras & SALUDOS:
+        background.add_task(
+            enviar_texto, de,
+            "👋 ¡Hola! Soy tu bot editor de imágenes.\n"
+            "Mándame una captura y te ayudo a cambiar un número. 📷",
+        )
+        return
+    if palabras & DESPEDIDAS:
+        background.add_task(
+            enviar_texto, de, "🙌 ¡De nada! Aquí estaré cuando necesites. 👋"
+        )
+        return
+    background.add_task(
+        enviar_texto, de,
+        "📷 Mándame una *imagen* y te pregunto qué número cambiar.",
+    )
+
+
+def procesar_edicion(destino, media_id, viejo, nuevo):
     try:
-        # Aviso rapido para que sepas que estamos trabajando
         enviar_texto(destino, "✏️ Editando tu imagen, dame unos segundos...")
-
-        # 1) Descargar la imagen que mando el usuario
         entrada = descargar_media(media_id)
         salida = entrada.replace(".jpg", "_editada.jpg")
 
-        # 2) Editar
         ok = reemplazar_texto(entrada, viejo, nuevo, salida)
         if not ok:
-            enviar_texto(
-                destino,
-                f"😕 No encontre '{viejo}' en la imagen.\n"
-                f"Escribelo IGUAL a como aparece (ej: 3.410).",
-            )
+            nums = listar_numeros(entrada)
+            if nums:
+                enviar_texto(
+                    destino,
+                    f"😕 No encontré '{viejo}' en la imagen.\n\n"
+                    f"Los números que veo son:\n  {'   '.join(nums)}\n\n"
+                    f"Mándame la imagen otra vez y dime el número correcto.",
+                )
+            else:
+                enviar_texto(
+                    destino,
+                    f"😕 No encontré '{viejo}'. Escríbelo tal como aparece.",
+                )
             return
 
-        # 3) Responder con la imagen editada
         enviar_imagen(destino, salida)
+        enviar_botones(
+            destino,
+            "✅ ¿Quieres editar otra?",
+            [("editar_otra", "✏️ Editar otra"), ("terminar", "🏁 Terminar")],
+        )
     except Exception as e:
         print("Error editando:", e)
         enviar_texto(
-            destino,
-            "⚠️ Ocurrio un error al editar. Intenta de nuevo en un momento.",
+            destino, "⚠️ Ocurrió un error al editar. Intenta de nuevo en un momento."
         )
 
 
 def parse_instruccion(texto):
-    """
-    Extrae (valor_viejo, valor_nuevo) del texto del usuario.
-    Toma los dos primeros numeros que aparezcan, en orden.
-    Ej: 'cambia 3.410 por 3.400' -> ('3.410', '3.400')
-    """
+    """Extrae (viejo, nuevo) tomando los dos primeros numeros del texto."""
     if not texto:
         return None, None
     numeros = re.findall(r"\d+[.,]\d+|\d+", texto)
     if len(numeros) >= 2:
         return numeros[0], numeros[1]
     return None, None
+
+
+def primer_numero(texto):
+    """Devuelve el primer numero que aparezca en el texto, o None."""
+    m = re.findall(r"\d+[.,]\d+|\d+", texto or "")
+    return m[0] if m else None
 
 
 # ------------------------------------------------------------
@@ -156,10 +249,8 @@ def _headers():
 
 
 def descargar_media(media_id):
-    # a) pedir la URL del archivo
     r = requests.get(f"{GRAPH}/{media_id}", headers=_headers(), timeout=TIMEOUT)
     url = r.json()["url"]
-    # b) descargar el archivo
     img = requests.get(url, headers=_headers(), timeout=TIMEOUT)
     ruta = os.path.join(tempfile.gettempdir(), f"{media_id}.jpg")
     with open(ruta, "wb") as f:
@@ -168,7 +259,6 @@ def descargar_media(media_id):
 
 
 def subir_media(ruta):
-    """Sube la imagen editada a Meta y devuelve su media_id."""
     with open(ruta, "rb") as f:
         archivos = {
             "file": ("imagen.jpg", f, "image/jpeg"),
@@ -218,18 +308,39 @@ def enviar_texto(destino, texto):
     )
 
 
-# Pagina de inicio simple para comprobar que el servidor vive
+def enviar_botones(destino, texto, botones):
+    """botones = lista de (id, titulo). Maximo 3 botones, titulo <= 20 letras."""
+    cuerpo = {
+        "messaging_product": "whatsapp",
+        "to": destino,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": texto},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": bid, "title": bt}}
+                    for bid, bt in botones
+                ]
+            },
+        },
+    }
+    requests.post(
+        f"{GRAPH}/{PHONE_NUMBER_ID}/messages",
+        headers=_headers(),
+        json=cuerpo,
+        timeout=TIMEOUT,
+    )
+
+
+# ------------------------------------------------------------
+#  Paginas auxiliares
+# ------------------------------------------------------------
 @app.get("/")
 async def inicio():
     return {"estado": "Bot del dolar funcionando"}
 
 
-# ID de tu cuenta de WhatsApp Business (lo vimos en la configuracion)
-WABA_ID = os.environ.get("WABA_ID", "1039029152028883")
-
-
-# Pagina "secreta" para enganchar la app a tu cuenta de WhatsApp.
-# Abrela UNA vez en el navegador despues de desplegar.
 @app.get("/activar")
 async def activar():
     try:
@@ -243,7 +354,6 @@ async def activar():
         return {"error": str(e)}
 
 
-# Pagina de Politica de Privacidad (Meta la pide para publicar la app)
 @app.get("/privacy")
 async def privacidad():
     html = """

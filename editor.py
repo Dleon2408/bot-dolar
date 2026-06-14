@@ -5,6 +5,7 @@
 #  posicion. Pensado para capturas limpias (fondo plano).
 # ============================================================
 
+import re
 from collections import Counter
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import pytesseract
@@ -20,16 +21,44 @@ def _normalizar(texto):
     return texto.replace(" ", "").strip()
 
 
+def _a_numero(texto):
+    """Convierte '2,43' o '2.430' a float, o None si no es numero."""
+    t = texto.replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _coincide(palabra, objetivo, objetivo_num):
+    """
+    Compara de forma TOLERANTE:
+      - coma o punto dan igual (2,43 == 2.43)
+      - mismo valor aunque sobren/falten ceros (2.43 == 2.430)
+      - tambien coincidencia parcial (objetivo dentro de la palabra)
+    """
+    p = palabra.replace(",", ".")
+    o = objetivo.replace(",", ".")
+    if p == o or o in p:
+        return True
+    if objetivo_num is not None:
+        pn = _a_numero(palabra)
+        if pn is not None and pn == objetivo_num:
+            return True
+    return False
+
+
 def _buscar_texto(img, valor_viejo):
     """
     Usa OCR para ubicar 'valor_viejo' en la imagen.
     Mejoras:
       - Amplia la imagen 2x para que el OCR lea mejor los numeros chicos.
-      - Da PRIORIDAD a la coincidencia EXACTA (asi '3.375' no se confunde
-        con otro numero); solo si no hay exacta, usa coincidencia parcial.
+      - Coincidencia TOLERANTE (comas/puntos, ceros de mas, valor numerico).
+      - Da PRIORIDAD a la coincidencia EXACTA; si no, usa la tolerante.
     Devuelve (left, top, width, height) o None si no lo encuentra.
     """
     objetivo = _normalizar(valor_viejo)
+    objetivo_num = _a_numero(objetivo)
 
     escala = 2
     grande = img.resize((img.width * escala, img.height * escala), Image.LANCZOS)
@@ -44,7 +73,6 @@ def _buscar_texto(img, valor_viejo):
             conf = float(datos["conf"][i])
         except ValueError:
             conf = 0
-        # Volvemos las coordenadas al tamano original (dividiendo por la escala)
         caja = (
             datos["left"][i] // escala,
             datos["top"][i] // escala,
@@ -53,14 +81,31 @@ def _buscar_texto(img, valor_viejo):
         )
         if palabra == objetivo:
             exactos.append((conf, caja))
-        elif objetivo in palabra:
+        elif _coincide(palabra, objetivo, objetivo_num):
             parciales.append((conf, caja))
 
     candidatos = exactos if exactos else parciales
     if not candidatos:
         return None
-    candidatos.sort(key=lambda c: c[0], reverse=True)  # mayor confianza primero
+    candidatos.sort(key=lambda c: c[0], reverse=True)
     return candidatos[0][1]
+
+
+def listar_numeros(ruta_imagen):
+    """
+    Devuelve la lista de numeros (tipo 3.410) que el OCR detecta en la imagen.
+    Sirve para mostrarle al usuario las opciones si no encontramos el suyo.
+    """
+    img = Image.open(ruta_imagen).convert("RGB")
+    grande = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    datos = pytesseract.image_to_data(grande, output_type=pytesseract.Output.DICT)
+    nums = []
+    for t in datos["text"]:
+        t = t.strip()
+        if re.match(r"^\d+[.,]\d+$", t):
+            nums.append(t)
+    # quitar repetidos manteniendo el orden
+    return list(dict.fromkeys(nums))
 
 
 def _region_ampliada(img, caja):
