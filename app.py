@@ -8,15 +8,20 @@ import re
 import tempfile
 
 import requests
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, BackgroundTasks
 
 from editor import reemplazar_texto
+
+# Memoria de mensajes ya procesados, para no responder dos veces
+# si Meta reenvia el mismo mensaje (reintentos).
+PROCESADOS = set()
 
 # ---- Configuracion (se lee de variables de entorno en Render) ----
 META_TOKEN = os.environ.get("META_TOKEN", "")          # Token de acceso de Meta
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")  # ID del numero de WhatsApp
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "fodie123")  # Lo inventas tu
 GRAPH = "https://graph.facebook.com/v21.0"
+TIMEOUT = 30  # segundos maximos de espera en cada llamada a Meta
 
 app = FastAPI()
 
@@ -37,21 +42,33 @@ async def verificar(request: Request):
 #  2) Recepcion de mensajes (Meta hace POST cuando te escriben)
 # ------------------------------------------------------------
 @app.post("/webhook")
-async def recibir(request: Request):
+async def recibir(request: Request, background: BackgroundTasks):
     data = await request.json()
     try:
         valor = data["entry"][0]["changes"][0]["value"]
         if "messages" not in valor:
             return {"ok": True}  # puede ser un "status", lo ignoramos
         mensaje = valor["messages"][0]
+
+        # Evitar duplicados: si ya vimos este mensaje, lo ignoramos
+        msg_id = mensaje.get("id")
+        if msg_id in PROCESADOS:
+            return {"ok": True}
+        PROCESADOS.add(msg_id)
+        if len(PROCESADOS) > 1000:      # no dejar que crezca infinito
+            PROCESADOS.clear()
+
         de = mensaje["from"]  # numero del que escribe
 
+        # Procesamos en SEGUNDO PLANO para responderle a Meta al instante
+        # (asi no reenvia el mensaje y no llegan imagenes repetidas).
         if mensaje.get("type") == "image":
             caption = mensaje["image"].get("caption", "")
             media_id = mensaje["image"]["id"]
-            procesar_imagen(de, media_id, caption)
+            background.add_task(procesar_imagen, de, media_id, caption)
         elif mensaje.get("type") == "text":
-            enviar_texto(
+            background.add_task(
+                enviar_texto,
                 de,
                 "Mandame una *imagen* con un texto (caption) tipo:\n"
                 "  cambia 3.410 por 3.400",
@@ -70,31 +87,46 @@ def procesar_imagen(destino, media_id, caption):
     if not viejo or not nuevo:
         enviar_texto(
             destino,
-            "No entendi el cambio. Escribe en el texto de la imagen algo como:\n"
+            "🤔 No entendi el cambio.\n\n"
+            "Manda la imagen y en el texto escribe que cambiar, por ejemplo:\n"
             "  cambia 3.410 por 3.400",
         )
         return
 
-    # 1) Descargar la imagen que mando el usuario
-    entrada = descargar_media(media_id)
-    salida = entrada.replace(".jpg", "_editada.jpg")
+    try:
+        # Aviso rapido para que sepas que estamos trabajando
+        enviar_texto(destino, "✏️ Editando tu imagen, dame unos segundos...")
 
-    # 2) Editar
-    ok = reemplazar_texto(entrada, viejo, nuevo, salida)
-    if not ok:
+        # 1) Descargar la imagen que mando el usuario
+        entrada = descargar_media(media_id)
+        salida = entrada.replace(".jpg", "_editada.jpg")
+
+        # 2) Editar
+        ok = reemplazar_texto(entrada, viejo, nuevo, salida)
+        if not ok:
+            enviar_texto(
+                destino,
+                f"😕 No encontre '{viejo}' en la imagen.\n"
+                f"Escribelo IGUAL a como aparece (ej: 3.410).",
+            )
+            return
+
+        # 3) Responder con la imagen editada
+        enviar_imagen(destino, salida)
+    except Exception as e:
+        print("Error editando:", e)
         enviar_texto(
             destino,
-            f"No encontre '{viejo}' en la imagen. "
-            f"Asegurate de escribirlo igual que aparece.",
+            "⚠️ Ocurrio un error al editar. Intenta de nuevo en un momento.",
         )
-        return
-
-    # 3) Responder con la imagen editada
-    enviar_imagen(destino, salida)
 
 
 def parse_instruccion(texto):
-    """Extrae (valor_viejo, valor_nuevo) del texto del usuario."""
+    """
+    Extrae (valor_viejo, valor_nuevo) del texto del usuario.
+    Toma los dos primeros numeros que aparezcan, en orden.
+    Ej: 'cambia 3.410 por 3.400' -> ('3.410', '3.400')
+    """
     if not texto:
         return None, None
     numeros = re.findall(r"\d+[.,]\d+|\d+", texto)
@@ -112,10 +144,10 @@ def _headers():
 
 def descargar_media(media_id):
     # a) pedir la URL del archivo
-    r = requests.get(f"{GRAPH}/{media_id}", headers=_headers())
+    r = requests.get(f"{GRAPH}/{media_id}", headers=_headers(), timeout=TIMEOUT)
     url = r.json()["url"]
     # b) descargar el archivo
-    img = requests.get(url, headers=_headers())
+    img = requests.get(url, headers=_headers(), timeout=TIMEOUT)
     ruta = os.path.join(tempfile.gettempdir(), f"{media_id}.jpg")
     with open(ruta, "wb") as f:
         f.write(img.content)
@@ -131,9 +163,15 @@ def subir_media(ruta):
             "type": (None, "image/jpeg"),
         }
         r = requests.post(
-            f"{GRAPH}/{PHONE_NUMBER_ID}/media", headers=_headers(), files=archivos
+            f"{GRAPH}/{PHONE_NUMBER_ID}/media",
+            headers=_headers(),
+            files=archivos,
+            timeout=TIMEOUT,
         )
-    return r.json()["id"]
+    datos = r.json()
+    if "id" not in datos:
+        raise RuntimeError(f"Meta no devolvio media id: {datos}")
+    return datos["id"]
 
 
 def enviar_imagen(destino, ruta):
@@ -145,7 +183,10 @@ def enviar_imagen(destino, ruta):
         "image": {"id": media_id},
     }
     requests.post(
-        f"{GRAPH}/{PHONE_NUMBER_ID}/messages", headers=_headers(), json=cuerpo
+        f"{GRAPH}/{PHONE_NUMBER_ID}/messages",
+        headers=_headers(),
+        json=cuerpo,
+        timeout=TIMEOUT,
     )
 
 
@@ -157,7 +198,10 @@ def enviar_texto(destino, texto):
         "text": {"body": texto},
     }
     requests.post(
-        f"{GRAPH}/{PHONE_NUMBER_ID}/messages", headers=_headers(), json=cuerpo
+        f"{GRAPH}/{PHONE_NUMBER_ID}/messages",
+        headers=_headers(),
+        json=cuerpo,
+        timeout=TIMEOUT,
     )
 
 
@@ -177,7 +221,9 @@ WABA_ID = os.environ.get("WABA_ID", "1039029152028883")
 async def activar():
     try:
         r = requests.post(
-            f"{GRAPH}/{WABA_ID}/subscribed_apps", headers=_headers()
+            f"{GRAPH}/{WABA_ID}/subscribed_apps",
+            headers=_headers(),
+            timeout=TIMEOUT,
         )
         return {"resultado": r.json()}
     except Exception as e:
