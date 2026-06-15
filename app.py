@@ -390,7 +390,8 @@ def enviar_botones(destino, texto, botones):
 # ------------------------------------------------------------
 #  Paginas auxiliares
 # ------------------------------------------------------------
-@app.get("/")
+# Acepta GET y HEAD para que monitores como UptimeRobot no den falso 405
+@app.api_route("/", methods=["GET", "HEAD"])
 async def inicio():
     return {"estado": "Bot del dolar funcionando"}
 
