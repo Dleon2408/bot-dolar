@@ -11,7 +11,7 @@ import tempfile
 import requests
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 
-from editor import reemplazar_texto, listar_numeros
+from editor import reemplazar_texto, reemplazar_varios, listar_numeros
 
 # Memoria de mensajes ya procesados, para no responder dos veces
 # si Meta reenvia el mismo mensaje (reintentos).
@@ -20,6 +20,9 @@ PROCESADOS = set()
 # Memoria del "formulario" de cada usuario (en que paso va).
 # de -> {"paso": "viejo"/"nuevo", "media_id": ..., "viejo": ...}
 ESTADOS = {}
+
+# Ultima imagen que mando cada usuario (para el boton "Corregir").
+ULTIMA_IMAGEN = {}
 
 # Palabras para reconocer saludos y despedidas
 SALUDOS = {"hola", "holi", "buenas", "buenos", "hi", "hello", "ola", "hey", "alo"}
@@ -94,12 +97,13 @@ async def recibir(request: Request, background: BackgroundTasks):
 
         if tipo == "image":
             media_id = mensaje["image"]["id"]
+            ULTIMA_IMAGEN[de] = media_id
             caption = mensaje["image"].get("caption", "")
-            viejo, nuevo = parse_instruccion(caption)
-            if viejo and nuevo:
-                # Camino rapido: vino todo en el texto de la imagen
+            pares = parse_pares(caption)
+            if pares:
+                # Camino rapido: vino todo en el texto (1 o varios cambios)
                 ESTADOS.pop(de, None)
-                background.add_task(procesar_edicion, de, media_id, viejo, nuevo)
+                background.add_task(procesar_edicion, de, media_id, pares)
             else:
                 # Inicia el formulario guiado
                 ESTADOS[de] = {"paso": "viejo", "media_id": media_id}
@@ -144,6 +148,24 @@ def manejar_texto(de, texto, background):
             enviar_texto, de, "🙌 ¡Listo! Aquí estaré cuando necesites. 👋"
         )
         return
+    if texto == "corregir":
+        # Reutiliza la ultima imagen para corregir sin reenviarla
+        media_id = ULTIMA_IMAGEN.get(de)
+        if media_id:
+            ESTADOS[de] = {"paso": "viejo", "media_id": media_id}
+            background.add_task(
+                enviar_texto, de,
+                "✏️ De acuerdo. ¿Qué número corrijo? (escríbelo como aparece)",
+            )
+        else:
+            background.add_task(enviar_texto, de, "📷 Mándame la imagen otra vez.")
+        return
+    if "cancelar" in palabras:
+        ESTADOS.pop(de, None)
+        background.add_task(
+            enviar_texto, de, "❌ Cancelado. Mándame una imagen cuando quieras."
+        )
+        return
     if texto == "ayuda" or "ayuda" in palabras or "menu" in palabras:
         background.add_task(enviar_texto, de, TEXTO_AYUDA)
         return
@@ -153,7 +175,9 @@ def manejar_texto(de, texto, background):
         num = primer_numero(texto)
         if not num:
             background.add_task(
-                enviar_texto, de, "Escríbeme solo el número, por ejemplo: 3.410"
+                enviar_texto, de,
+                "Escríbeme solo el número, por ejemplo: 3.410\n"
+                "(o escribe *cancelar* para salir)",
             )
             return
         if estado["paso"] == "viejo":
@@ -167,7 +191,7 @@ def manejar_texto(de, texto, background):
             media_id = estado["media_id"]
             viejo = estado["viejo"]
             ESTADOS.pop(de, None)
-            background.add_task(procesar_edicion, de, media_id, viejo, num)
+            background.add_task(procesar_edicion, de, media_id, [(viejo, num)])
             return
 
     # --- Sin formulario activo: saludo / despedida / otro ---
@@ -189,50 +213,80 @@ def manejar_texto(de, texto, background):
     )
 
 
-def procesar_edicion(destino, media_id, viejo, nuevo):
+def procesar_edicion(destino, media_id, pares):
+    """pares = lista de (viejo, nuevo). Edita, responde y limpia."""
+    entrada = salida = None
     try:
         enviar_texto(destino, "✏️ Editando tu imagen, dame unos segundos...")
         entrada = descargar_media(media_id)
         salida = entrada.replace(".jpg", "_editada.jpg")
 
-        ok = reemplazar_texto(entrada, viejo, nuevo, salida)
-        if not ok:
+        resultados = reemplazar_varios(entrada, pares, salida)
+        hechos = [v for v, ok in resultados if ok]
+        fallidos = [v for v, ok in resultados if not ok]
+
+        if not hechos:
+            # No se logro ningun cambio: mostrar los numeros detectados
             nums = listar_numeros(entrada)
             if nums:
                 enviar_texto(
                     destino,
-                    f"😕 No encontré '{viejo}' en la imagen.\n\n"
+                    f"😕 No encontré {', '.join(fallidos)} en la imagen.\n\n"
                     f"Los números que veo son:\n  {'   '.join(nums)}\n\n"
-                    f"Mándame la imagen otra vez y dime el número correcto.",
+                    f"Toca *Corregir* y dime el número correcto.",
+                )
+                enviar_botones(
+                    destino, "👇",
+                    [("corregir", "✏️ Corregir"), ("terminar", "🏁 Terminar")],
                 )
             else:
                 enviar_texto(
                     destino,
-                    f"😕 No encontré '{viejo}'. Escríbelo tal como aparece.",
+                    f"😕 No encontré {', '.join(fallidos)}. Escríbelo tal como aparece.",
                 )
             return
 
+        # Hubo al menos un cambio: enviamos la imagen
         enviar_imagen(destino, salida)
+        aviso = "✅ ¿Quedó bien? Si no, toca *Corregir*."
+        if fallidos:
+            aviso = (
+                f"⚠️ Cambié {', '.join(hechos)}, pero no encontré "
+                f"{', '.join(fallidos)}.\n¿Quieres corregir?"
+            )
         enviar_botones(
-            destino,
-            "✅ ¿Quieres editar otra?",
-            [("editar_otra", "✏️ Editar otra"), ("terminar", "🏁 Terminar")],
+            destino, aviso,
+            [("corregir", "✏️ Corregir"), ("terminar", "🏁 Terminar")],
         )
     except Exception as e:
         print("Error editando:", e)
         enviar_texto(
             destino, "⚠️ Ocurrió un error al editar. Intenta de nuevo en un momento."
         )
+    finally:
+        # Limpieza de archivos temporales
+        for ruta in (entrada, salida):
+            try:
+                if ruta and os.path.exists(ruta):
+                    os.remove(ruta)
+            except OSError:
+                pass
 
 
-def parse_instruccion(texto):
-    """Extrae (viejo, nuevo) tomando los dos primeros numeros del texto."""
+def parse_pares(texto):
+    """
+    Extrae una lista de pares (viejo, nuevo) del texto.
+    Toma los numeros en orden y los empareja: 1o-2o, 3o-4o, ...
+    Ej: 'cambia 3.410 por 3.400 y 3.375 por 3.380'
+        -> [('3.410','3.400'), ('3.375','3.380')]
+    """
     if not texto:
-        return None, None
+        return []
     numeros = re.findall(r"\d+[.,]\d+|\d+", texto)
-    if len(numeros) >= 2:
-        return numeros[0], numeros[1]
-    return None, None
+    pares = []
+    for i in range(0, len(numeros) - 1, 2):
+        pares.append((numeros[i], numeros[i + 1]))
+    return pares
 
 
 def primer_numero(texto):

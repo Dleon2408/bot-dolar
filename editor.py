@@ -213,18 +213,18 @@ def _fuente_por_alto(texto, alto_objetivo):
     return ImageFont.truetype(config.FONT_PATH, size)
 
 
-def reemplazar_texto(ruta_imagen, valor_viejo, valor_nuevo, ruta_salida):
+def _editar(img, valor_viejo, valor_nuevo):
     """
-    Funcion principal. Reemplaza valor_viejo por valor_nuevo.
-    Devuelve True si lo logro, False si no encontro el texto.
+    Hace UN reemplazo sobre la imagen (objeto PIL en RGB).
+    Devuelve (img_resultante, exito).
     """
-    img = Image.open(ruta_imagen).convert("RGB")
-
     caja_ocr = _buscar_texto(img, valor_viejo)
     if caja_ocr is None:
-        return False
+        return img, False
 
     # 1) Analizamos colores en una region ampliada
+    #    (el fondo y la tinta se detectan AUTOMATICAMENTE, sea cual sea
+    #     su color: blanco, amarillo, verde, texto negro, rojo, etc.)
     region, x_off, y_off = _region_ampliada(img, caja_ocr)
     color_fondo = _color_de_fondo(region)
     color_letra = _color_de_letra(region, color_fondo)
@@ -251,8 +251,8 @@ def reemplazar_texto(ruta_imagen, valor_viejo, valor_nuevo, ruta_salida):
     pos_x = centro_x - ancho_texto / 2 - bb[0]
     pos_y = top - bb[1]  # alinea el tope de la tinta con el tope real
 
-    # 5) Dibujamos el texto en una capa aparte, le aplicamos un leve
-    #    desenfoque para igualar la calidad de la captura, y lo fusionamos.
+    # 5) Dibujamos el texto en una capa aparte, con el COLOR DETECTADO de la
+    #    letra, le aplicamos un leve desenfoque y lo fusionamos.
     capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
     ImageDraw.Draw(capa).text(
         (pos_x, pos_y), valor_nuevo, font=fuente, fill=color_letra + (255,)
@@ -262,5 +262,30 @@ def reemplazar_texto(ruta_imagen, valor_viejo, valor_nuevo, ruta_salida):
 
     base = img.convert("RGBA")
     base.alpha_composite(capa)
-    base.convert("RGB").save(ruta_salida)
-    return True
+    return base.convert("RGB"), True
+
+
+def reemplazar_texto(ruta_imagen, valor_viejo, valor_nuevo, ruta_salida):
+    """
+    Reemplaza valor_viejo por valor_nuevo. Devuelve True/False.
+    """
+    img = Image.open(ruta_imagen).convert("RGB")
+    img, exito = _editar(img, valor_viejo, valor_nuevo)
+    if exito:
+        img.save(ruta_salida)
+    return exito
+
+
+def reemplazar_varios(ruta_imagen, pares, ruta_salida):
+    """
+    Hace varios reemplazos sobre la misma imagen.
+    'pares' = lista de (viejo, nuevo).
+    Devuelve lista de (viejo, exito) y guarda el resultado.
+    """
+    img = Image.open(ruta_imagen).convert("RGB")
+    resultados = []
+    for viejo, nuevo in pares:
+        img, exito = _editar(img, viejo, nuevo)
+        resultados.append((viejo, exito))
+    img.save(ruta_salida)
+    return resultados
